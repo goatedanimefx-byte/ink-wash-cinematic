@@ -1,0 +1,1290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ink Wash Cinematic – The Monk's Path</title>
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #050505;
+  height: 100%;
+  overflow: hidden;
+  font-family: Georgia, serif;
+  color: #f6f3e9;
+}
+canvas {
+  display: block;
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  object-fit: contain;
+  background: #050505;
+}
+#status {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  color: rgba(255,255,255,0.55);
+  font-size: 12px;
+  pointer-events: none;
+  z-index: 2;
+}
+.ink-captions {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 20;
+}
+.ink-caption {
+  position: absolute;
+  left: 9%;
+  right: 9%;
+  bottom: 12%;
+  text-align: center;
+  font-family: Georgia, "Songti SC", "Noto Serif SC", serif;
+  font-size: clamp(22px, 3.2vmin, 46px);
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  color: rgba(246, 243, 233, 0.97);
+  text-shadow: 0 2px 18px rgba(0,0,0,0.75), 0 0 6px rgba(0,0,0,0.6);
+  padding: 0 8px;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(14px);
+  will-change: opacity, transform;
+}
+.ink-caption-final {
+  bottom: 19%;
+  font-size: clamp(28px, 4vmin, 58px);
+  font-weight: 600;
+}
+.controls {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 12px;
+  z-index: 10;
+  opacity: 0.85;
+}
+.controls button {
+  background: rgba(20,20,24,0.85);
+  color: #e0d8c7;
+  border: 1px solid rgba(120,110,90,0.45);
+  border-radius: 6px;
+  padding: 8px 18px;
+  font-family: Georgia, serif;
+  font-size: 16px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  min-width: 80px;
+}
+.controls button:hover {
+  background: rgba(40,40,44,0.95);
+  border-color: rgba(160,150,130,0.65);
+}
+.controls button:active {
+  transform: translateY(1px);
+}
+.controls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+#time {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  font-size: 12px;
+  color: rgba(255,255,255,0.45);
+  pointer-events: none;
+  z-index: 2;
+}
+#maskA, #maskB {
+  display: none;
+}
+</style>
+</head>
+<body>
+<canvas id="gl" width="1080" height="1920"></canvas>
+<div id="maskA"></div>
+<div id="maskB"></div>
+<div id="status">ink‑wash cinematic – loading</div>
+<div id="time">t = 0.00</div>
+<div class="controls">
+  <button id="play">Play</button>
+  <button id="pause">Pause</button>
+  <button id="replay">Replay</button>
+</div>
+<div id="captionHost"></div>
+
+<script>
+// ========== B1 Shader engine (inline) ==========
+// B1 Shader engine - Ink Wash Cinematic
+// Global functions: initShader, renderFrame, createMaskCanvases
+
+const B1_W = 1080;
+const B1_H = 1920;
+
+let _b1gl = null;
+let _b1program = null;
+let _b1uniforms = null;
+let _b1vao = null;
+let _b1texA = null;
+let _b1texB = null;
+let _b1maskA = null;
+let _b1maskB = null;
+let _b1ctxA = null;
+let _b1ctxB = null;
+let _b1fallbackMode = false;
+
+function _b1compile(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(sh);
+    gl.deleteShader(sh);
+    throw new Error('Shader compile error: ' + log);
+  }
+  return sh;
+}
+
+const B1_VS = `#version 300 es
+in vec2 a_position;
+out vec2 v_uv;
+void main(){
+  v_uv = a_position * 0.5 + 0.5;
+  gl_Position = vec4(a_position, 0.0, 1.0);
+}`;
+
+const B1_FS = `#version 300 es
+precision highp float;
+uniform float u_time;
+uniform vec2 u_resolution;
+uniform vec2 u_cameraOffset;
+uniform sampler2D u_maskA;
+uniform sampler2D u_maskB;
+uniform float u_transition;
+in vec2 v_uv;
+out vec4 fragColor;
+
+float hash21(vec2 p){
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+float noise(vec2 p){
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+float fbm(vec2 p){
+  float v = 0.0;
+  float a = 0.52;
+  mat2 m = mat2(0.866, 0.5, -0.5, 0.866);
+  for (int i = 0; i < 5; i++) {
+    v += a * noise(p);
+    p = m * p * 2.03;
+    a *= 0.5;
+  }
+  return v;
+}
+
+void main(){
+  vec2 uv = v_uv;
+  vec2 px = 1.0 / u_resolution;
+
+  float trans = clamp(u_transition, 0.0, 1.0);
+  float radius = trans * 1.32;
+  float radial = length(uv - vec2(0.5));
+  float newVisible = smoothstep(radius + 0.10, radius - 0.10, radial);
+  float boundary = exp(-abs(radial - radius) * 12.0);
+
+  float t = u_time;
+  vec2 q = uv * 3.2 + u_cameraOffset * 0.35;
+  float n1 = fbm(q + vec2(t * 0.035, -t * 0.021));
+  float n2 = fbm(q + vec2(-t * 0.017, t * 0.029) + 17.0);
+  vec2 warped = uv + (vec2(n1,n2) - 0.5) * 0.055;
+  warped = clamp(warped, px, 1.0 - px);
+
+  float inkA = texture(u_maskA, warped).g;
+  float inkB = texture(u_maskB, warped).g;
+  float ink = mix(inkA, inkB, newVisible);
+  float redA = texture(u_maskA, warped).r;
+  float redB = texture(u_maskB, warped).r;
+  float red = mix(redA, redB, newVisible);
+
+  vec2 paperP = (uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0) * 4.5 + u_cameraOffset;
+  float fibre = fbm(paperP * 2.7 + vec2(t * 0.012, -t * 0.009));
+  float fibreFine = fbm(paperP * 11.0 - vec2(t * 0.018, t * 0.011));
+  float paper = 0.72 + 0.20 * fibre + 0.08 * fibreFine;
+
+  float e = 2.0 / max(u_resolution.x, u_resolution.y);
+  float il = texture(u_maskA, clamp(warped + vec2(-e, 0.0), px, 1.0 - px)).g;
+  float ir = texture(u_maskA, clamp(warped + vec2(e, 0.0), px, 1.0 - px)).g;
+  float it = texture(u_maskA, clamp(warped + vec2(0.0, -e), px, 1.0 - px)).g;
+  float ib = texture(u_maskA, clamp(warped + vec2(0.0, e), px, 1.0 - px)).g;
+  float grad = length(vec2(ir - il, ib - it));
+  float pool = smoothstep(0.06, 0.32, grad) * smoothstep(0.05, 0.55, ink);
+
+  float streak = fbm(vec2(paperP.x * 1.3, paperP.y * 14.0) + vec2(t * 0.04, -t * 0.02));
+  float brush = smoothstep(0.60, 0.86, streak) * ink;
+
+  vec3 paperColor = vec3(0.90, 0.84, 0.76) * paper;
+  vec3 inkColor = vec3(0.07, 0.08, 0.11);
+
+  float inkAlpha = smoothstep(0.03, 0.42, ink + boundary * 0.18);
+  vec3 col = mix(paperColor, inkColor, inkAlpha);
+  col = mix(col, inkColor * 0.55, pool * 0.55);
+  col = mix(col, inkColor * 0.72, brush * 0.30);
+
+  float mist = fbm(paperP * 0.85 + vec2(t * 0.018, t * 0.012));
+  mist = smoothstep(0.45, 0.82, mist);
+  float mistAmt = mist * (0.34 - 0.18 * inkAlpha);
+  col = mix(col, vec3(0.88, 0.90, 0.93), mistAmt);
+
+  float redGlow = red * smoothstep(0.05, 0.75, red);
+  col += vec3(0.78, 0.10, 0.06) * redGlow * 0.75;
+  col += vec3(1.0, 0.34, 0.22) * pow(redGlow, 1.8) * 0.95;
+
+  float vig = smoothstep(1.18, 0.30, length(uv - vec2(0.5)) * 1.35);
+  col *= vig;
+
+  float grain = (hash21(gl_FragCoord.xy + fract(t * 37.0) * 1000.0) - 0.5) * 0.09;
+  col += grain;
+
+  col = clamp(col, 0.0, 1.0);
+  fragColor = vec4(col, 1.0);
+}`;
+
+function _b1fallback(message) {
+  if (typeof document === 'undefined') return;
+  const glCanvas = document.getElementById('gl');
+  if (!glCanvas) return;
+  const c = document.createElement('canvas');
+  c.width = B1_W; c.height = B1_H;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#efe7d8';
+  ctx.fillRect(0, 0, B1_W, B1_H);
+  for (let i = 0; i < 9000; i++) {
+    const x = Math.random() * B1_W, y = Math.random() * B1_H;
+    ctx.fillStyle = 'rgba(90,70,45,' + (Math.random() * 0.08) + ')';
+    ctx.fillRect(x, y, 1, 1);
+  }
+  ctx.fillStyle = '#2b2118';
+  ctx.font = 'bold 52px Georgia';
+  ctx.textAlign = 'center';
+  ctx.fillText('WebGL2 unavailable', B1_W / 2, B1_H / 2 - 40);
+  ctx.font = '30px Georgia';
+  ctx.fillText(message || 'This browser does not support WebGL2.', B1_W / 2, B1_H / 2 + 30);
+  ctx.fillText('Ink-wash shader engine cannot run.', B1_W / 2, B1_H / 2 + 80);
+  if (glCanvas.parentNode) glCanvas.parentNode.replaceChild(c, glCanvas);
+  const s = document.getElementById('status');
+  if (s) s.textContent = 'webgl2 fallback';
+}
+
+function initShader() {
+  if (typeof document === 'undefined') {
+    return { gl: null, program: null, uniforms: null };
+  }
+  const glCanvas = document.getElementById('gl');
+  if (!glCanvas) {
+    return { gl: null, program: null, uniforms: null };
+  }
+  const gl = glCanvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, preserveDrawingBuffer: false });
+  if (!gl) {
+    _b1fallback('WebGL2 context could not be created.');
+    _b1fallbackMode = true;
+    return { gl: null, program: null, uniforms: null };
+  }
+
+  let program;
+  try {
+    const vs = _b1compile(gl, gl.VERTEX_SHADER, B1_VS);
+    const fs = _b1compile(gl, gl.FRAGMENT_SHADER, B1_FS);
+    program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error('Program link error: ' + gl.getProgramInfoLog(program));
+    }
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+  } catch (err) {
+    _b1fallback(err.message);
+    console.error(err);
+    _b1fallbackMode = true;
+    return { gl: null, program: null, uniforms: null };
+  }
+
+  gl.useProgram(program);
+
+  const aPos = gl.getAttribLocation(program, 'a_position');
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+
+  function makeTex() {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+  const texA = makeTex();
+  const texB = makeTex();
+
+  const uniforms = {
+    u_time: gl.getUniformLocation(program, 'u_time'),
+    u_resolution: gl.getUniformLocation(program, 'u_resolution'),
+    u_cameraOffset: gl.getUniformLocation(program, 'u_cameraOffset'),
+    u_maskA: gl.getUniformLocation(program, 'u_maskA'),
+    u_maskB: gl.getUniformLocation(program, 'u_maskB'),
+    u_transition: gl.getUniformLocation(program, 'u_transition')
+  };
+
+  _b1gl = gl;
+  _b1program = program;
+  _b1uniforms = uniforms;
+  _b1vao = vao;
+  _b1texA = texA;
+  _b1texB = texB;
+
+  return { gl: gl, program: program, uniforms: uniforms };
+}
+
+function createMaskCanvases() {
+  if (typeof document === 'undefined') {
+    return { maskA: null, maskB: null, ctxA: null, ctxB: null };
+  }
+  const maskA = document.createElement('canvas');
+  const maskB = document.createElement('canvas');
+  maskA.width = maskB.width = B1_W;
+  maskA.height = maskB.height = B1_H;
+  maskA.id = 'maskA';
+  maskB.id = 'maskB';
+  maskA.style.display = 'none';
+  maskB.style.display = 'none';
+  const ctxA = maskA.getContext('2d');
+  const ctxB = maskB.getContext('2d');
+  if (document.body) {
+    document.body.appendChild(maskA);
+    document.body.appendChild(maskB);
+  }
+  _b1maskA = maskA;
+  _b1maskB = maskB;
+  _b1ctxA = ctxA;
+  _b1ctxB = ctxB;
+  return { maskA: maskA, maskB: maskB, ctxA: ctxA, ctxB: ctxB };
+}
+
+function renderFrame(t, cameraOffset, transition) {
+  if (_b1fallbackMode === true || !_b1gl || !_b1program) return;
+  const gl = _b1gl;
+  if (_b1maskA && _b1maskB) {
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.bindTexture(gl.TEXTURE_2D, _b1texA);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, _b1maskA);
+    gl.bindTexture(gl.TEXTURE_2D, _b1texB);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, _b1maskB);
+  }
+
+  let cx = 0, cy = 0;
+  if (typeof cameraOffset === 'number') {
+    cx = cameraOffset;
+  } else if (Array.isArray(cameraOffset)) {
+    cx = cameraOffset[0] || 0;
+    cy = cameraOffset[1] || 0;
+  } else if (cameraOffset && typeof cameraOffset === 'object') {
+    cx = (cameraOffset.x !== undefined) ? cameraOffset.x : (cameraOffset[0] || 0);
+    cy = (cameraOffset.y !== undefined) ? cameraOffset.y : (cameraOffset[1] || 0);
+  }
+
+  gl.viewport(0, 0, B1_W, B1_H);
+  gl.clearColor(0.02, 0.02, 0.02, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(_b1program);
+  gl.uniform1f(_b1uniforms.u_time, t);
+  gl.uniform2f(_b1uniforms.u_resolution, B1_W, B1_H);
+  gl.uniform2f(_b1uniforms.u_cameraOffset, cx, cy);
+  gl.uniform1f(_b1uniforms.u_transition, transition);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, _b1texA);
+  gl.uniform1i(_b1uniforms.u_maskA, 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, _b1texB);
+  gl.uniform1i(_b1uniforms.u_maskB, 1);
+  gl.bindVertexArray(_b1vao);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.bindVertexArray(null);
+}
+</script>
+<script>
+// ========== B2 Puppet characters (inline) ==========
+// b2-characters.js — articulated ink-brush puppet (B2)
+// Draws the pilgrim monk into the mask canvas GREEN channel only:
+// every stroke is rgba(0,255,0,alpha). Called from drawMask().
+
+(function (global) {
+  'use strict';
+
+  // Tapered ink-brush segment: circle at a, circle at b, widths wa->wb.
+  function inkSeg(ctx, ax, ay, bx, by, wa, wb) {
+    var dx = bx - ax, dy = by - ay;
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (len < 0.001) { // dot
+      ctx.beginPath();
+      ctx.arc(ax, ay, Math.max(wa, 0.5), 0, Math.PI * 2);
+      ctx.fill();
+      return;
+    }
+    var nx = -dy / len, ny = dx / len; // perpendicular
+    var ha = wa / 2, hb = wb / 2;
+    ctx.beginPath();
+    ctx.moveTo(ax + nx * ha, ay + ny * ha);
+    ctx.lineTo(bx + nx * hb, by + ny * hb);
+    ctx.arc(bx, by, hb, Math.atan2(ny, nx), Math.atan2(-ny, -nx), true);
+    ctx.lineTo(ax - nx * ha, ay - ny * ha);
+    ctx.arc(ax, ay, ha, Math.atan2(-ny, -nx), Math.atan2(ny, nx), true);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // One joint: position + limb segment drawn toward child joint.
+  function limb(ctx, j0, j1, w0, w1) {
+    inkSeg(ctx, j0.x, j0.y, j1.x, j1.y, w0, w1);
+  }
+
+  // Build skeleton for pose at time t. Returns joint object.
+  function skeleton(x, y, t, pose) {
+    // y = ground (foot) level; figure grows upward (negative y).
+    var S = { // standing proportions (units, scaled later by caller via x/y)
+      hipY: -70, shY: -118, headY: -150,
+      thigh: 46, shin: 44, upperArm: 34, foreArm: 30
+    };
+    var j = {
+      hip: { x: x, y: y + S.hipY },
+      shoulder: { x: x, y: y + S.shY },
+      head: { x: x, y: y + S.headY },
+      kneeL: { x: 0, y: 0 }, ankleL: { x: 0, y: 0 },
+      kneeR: { x: 0, y: 0 }, ankleR: { x: 0, y: 0 },
+      elbowL: { x: 0, y: 0 }, wristL: { x: 0, y: 0 },
+      elbowR: { x: 0, y: 0 }, wristR: { x: 0, y: 0 }
+    };
+
+    var ph = t * 4.2; // walk cycle phase
+    var sw = Math.sin(ph), sw2 = Math.sin(ph + Math.PI);
+
+    function leg(side, swing, stance) {
+      var hip = { x: j.hip.x + side * 10, y: j.hip.y };
+      var kneeX = hip.x + swing * 22;
+      var kneeY = hip.y + S.thigh - Math.abs(stance) * 8;
+      var ankleX = hip.x + swing * 34;
+      var ankleY = y;
+      if (pose === 'sit' || pose === 'rise') { // folded
+        kneeX = hip.x + side * 26; kneeY = hip.y + 22;
+        ankleX = hip.x + side * 34; ankleY = y - 6;
+      }
+      return { hip: hip, knee: { x: kneeX, y: kneeY }, ankle: { x: ankleX, y: ankleY } };
+    }
+    var L = leg(-1, sw, sw2), R = leg(1, sw2, sw);
+    j.kneeL = L.knee; j.ankleL = L.ankle;
+    j.kneeR = R.knee; j.ankleR = R.ankle;
+
+    // Arms swing opposite legs.
+    function arm(side, swing) {
+      var sh = { x: j.shoulder.x + side * 12, y: j.shoulder.y };
+      var el = { x: sh.x + swing * 16, y: sh.y + S.upperArm };
+      var wr = { x: el.x + swing * 22, y: el.y + S.foreArm };
+      if (pose === 'sit' || pose === 'rise') { // hands in lap
+        el = { x: sh.x + side * 14, y: sh.y + S.upperArm - 6 };
+        wr = { x: j.hip.x + side * 8, y: j.hip.y + 10 };
+      }
+      if (pose === 'bowHead') { // arms hang, hands low
+        el = { x: sh.x + side * 4, y: sh.y + S.upperArm + 4 };
+        wr = { x: el.x, y: el.y + S.foreArm + 4 };
+      }
+      return { shoulder: sh, elbow: el, wrist: wr };
+    }
+    var AL = arm(-1, -sw), AR = arm(1, -sw2);
+    j.elbowL = AL.elbow; j.wristL = AL.wrist;
+    j.elbowR = AR.elbow; j.wristR = AR.wrist;
+
+    // Head: bow or breathe.
+    var breathe = Math.sin(t * 1.6) * 2;
+    if (pose === 'bowHead') j.head.y += 26;
+    if (pose === 'idle') j.head.y += breathe;
+    if (pose === 'sit' || pose === 'rise') j.head.y += 8;
+    j.shoulder.y += (pose === 'idle') ? breathe : 0;
+    return j;
+  }
+
+  /**
+   * drawMonk(ctx, x, y, t, pose)
+   * ctx  : 2D context of mask canvas (green channel ink).
+   * x,y  : foot-ground anchor.
+   * t    : elapsed seconds (drives cycle + breathing).
+   * pose : 'walk' | 'idle' | 'sit' | 'rise' | 'bowHead'
+   */
+  function drawMonk(ctx, x, y, t, pose) {
+    if (!ctx) return;
+    pose = pose || 'walk';
+    var j = skeleton(x, y, t, pose);
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,255,0,0.92)';
+    ctx.strokeStyle = 'rgba(0,255,0,0.92)';
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    var walking = (pose === 'walk');
+    var sway = walking ? Math.sin(t * 4.2) * 3 : Math.sin(t * 1.6) * 1.5;
+
+    // Robe torso: hip -> shoulder, wide tapering brush stroke.
+    inkSeg(ctx, j.hip.x + sway, j.hip.y, j.shoulder.x + sway * 0.5, j.shoulder.y, 34, 22);
+    // Robe skirt flare toward ground.
+    inkSeg(ctx, j.hip.x - 8, j.hip.y + 4, j.hip.x - 22 + sway, y - 2, 26, 10);
+    inkSeg(ctx, j.hip.x + 8, j.hip.y + 4, j.hip.x + 22 + sway, y - 2, 26, 10);
+
+    // Legs: hip -> knee -> ankle, thinning widths.
+    limb(ctx, j.hip, j.kneeL, 18, 12); limb(ctx, j.kneeL, j.ankleL, 12, 7);
+    limb(ctx, j.hip, j.kneeR, 18, 12); limb(ctx, j.kneeR, j.ankleR, 12, 7);
+
+    // Arms: shoulder -> elbow -> wrist.
+    limb(ctx, j.shoulder, j.elbowL, 14, 10); limb(ctx, j.elbowL, j.wristL, 10, 6);
+    limb(ctx, j.shoulder, j.elbowR, 14, 10); limb(ctx, j.elbowR, j.wristR, 10, 6);
+
+    // Head: ink circle + topknot.
+    ctx.beginPath();
+    ctx.arc(j.head.x + sway * 0.4, j.head.y, 13, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(j.head.x + sway * 0.4, j.head.y - 14, 4, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  // Export (module + browser global).
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { drawMonk: drawMonk, inkSeg: inkSeg };
+  } else {
+    global.drawMonk = drawMonk;
+    global.inkSeg = inkSeg;
+  }
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<script>
+// ========== B3 World layers (inline) ==========
+/* b3-world.js - Ink Wash Cinematic - parallax world layers
+ *
+ * Interface (PARTS_API.md):
+ *   drawWorldLayers(ctx, t, cameraOffset[, variant])
+ *     ctx          - 2D context of maskA or maskB (1080x1920)
+ *     t            - timeline seconds, 0..60
+ *     cameraOffset - number (horizontal pan) OR {x, y} pan/tilt in pixels
+ *     variant      - optional 0|1. Omitted: inferred from t (1 when t >= 35).
+ *                    Lantern (red channel) only draws for variant 1 at t >= 34.
+ *
+ * Ink layers paint the GREEN channel: rgba(0, g, 0, a).
+ * Lantern paints the RED channel:   rgba(r, 0, 0, a).
+ * Caller owns canvas clear. This function never clears.
+ */
+
+var B3_W = 1080;
+var B3_H = 1920;
+var B3_TAU = Math.PI * 2;
+
+/* Deterministic hash. Same i/seed -> same value. No Math.random. */
+function b3Rand(i, seed) {
+  var v = Math.sin(i * 127.1 + seed * 311.7) * 43758.5453123;
+  return v - Math.floor(v);
+}
+
+function b3Clamp01(v) {
+  return v < 0 ? 0 : (v > 1 ? 1 : v);
+}
+
+function b3Ink(g, a) {
+  return 'rgba(0,' + (g | 0) + ',0,' + b3Clamp01(a).toFixed(3) + ')';
+}
+
+function b3Red(r, a) {
+  return 'rgba(' + (r | 0) + ',0,0,' + b3Clamp01(a).toFixed(3) + ')';
+}
+
+function b3Cam(cameraOffset) {
+  if (cameraOffset && typeof cameraOffset === 'object') {
+    return { x: Number(cameraOffset.x) || 0, y: Number(cameraOffset.y) || 0 };
+  }
+  return { x: Number(cameraOffset) || 0, y: 0 };
+}
+
+function b3Sun(ctx, t, cam) {
+  var sx = B3_W * 0.70 + cam.x * 0.04;
+  var sy = B3_H * 0.17 + cam.y * 0.04;
+  var pulse = 1 + 0.02 * Math.sin(t * 0.5);
+  var r = 300 * pulse;
+
+  ctx.save();
+  var glow = ctx.createRadialGradient(sx, sy, 18, sx, sy, r);
+  glow.addColorStop(0, b3Ink(150, 0.18));
+  glow.addColorStop(0.22, b3Ink(140, 0.12));
+  glow.addColorStop(0.60, b3Ink(120, 0.05));
+  glow.addColorStop(1, b3Ink(100, 0));
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(sx, sy, r, 0, B3_TAU);
+  ctx.fill();
+
+  ctx.strokeStyle = b3Ink(160, 0.14);
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(sx, sy, r * 0.30, 0, B3_TAU);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function b3Ridge(ctx, baseY, amp, seed, alpha) {
+  var n = 10;
+  var dx = (B3_W + 600) / n;
+  var prevX = -300;
+  var prevY = baseY - b3Rand(0, seed) * amp * 0.30;
+
+  ctx.beginPath();
+  ctx.moveTo(-300, B3_H + 200);
+  ctx.lineTo(-300, baseY);
+
+  for (var i = 1; i <= n; i++) {
+    var x = -300 + i * dx;
+    var peak = baseY - (0.25 + b3Rand(i, seed) * 0.75) * amp;
+    ctx.quadraticCurveTo(prevX + dx * 0.5, prevY - amp * 0.22, x, peak);
+    prevX = x;
+    prevY = peak;
+  }
+
+  ctx.lineTo(B3_W + 300, B3_H + 200);
+  ctx.closePath();
+  ctx.fillStyle = b3Ink(120, alpha);
+  ctx.fill();
+
+  ctx.strokeStyle = b3Ink(150, alpha * 0.55);
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function b3Mountains(ctx, t, cam) {
+  var drift = Math.sin(t * 0.09) * 26 - t * 1.6;
+  var layers = [
+    { y: B3_H * 0.30, amp: 210, a: 0.10, seed: 1, f: 0.06 },
+    { y: B3_H * 0.39, amp: 165, a: 0.13, seed: 5, f: 0.10 },
+    { y: B3_H * 0.48, amp: 120, a: 0.16, seed: 9, f: 0.15 }
+  ];
+
+  for (var i = 0; i < layers.length; i++) {
+    var L = layers[i];
+    ctx.save();
+    ctx.translate(cam.x * L.f + drift * L.f * 4, cam.y * L.f * 0.4);
+    b3Ridge(ctx, L.y, L.amp, L.seed, L.a);
+    ctx.restore();
+  }
+}
+
+function b3MistBand(ctx, y, h, alpha, drift) {
+  var g = ctx.createLinearGradient(0, y - h / 2, 0, y + h / 2);
+  g.addColorStop(0, b3Ink(95, 0));
+  g.addColorStop(0.45, b3Ink(95, alpha));
+  g.addColorStop(0.55, b3Ink(95, alpha));
+  g.addColorStop(1, b3Ink(95, 0));
+  ctx.fillStyle = g;
+  ctx.fillRect(-300 + drift, y - h / 2, B3_W + 600, h);
+}
+
+function b3Mist(ctx, t, cam, near) {
+  var speed = near ? 15 : 7;
+  var drift = ((t * speed) % 260) - 130;
+  var bands = near
+    ? [{ y: B3_H * 0.64, h: 230, a: 0.09 }, { y: B3_H * 0.79, h: 300, a: 0.07 }]
+    : [{ y: B3_H * 0.42, h: 280, a: 0.07 }, { y: B3_H * 0.52, h: 220, a: 0.05 }];
+  var factor = near ? 0.45 : 0.20;
+
+  ctx.save();
+  ctx.translate(cam.x * factor, cam.y * factor);
+  for (var i = 0; i < bands.length; i++) {
+    b3MistBand(ctx, bands[i].y, bands[i].h, bands[i].a, drift * (near ? 1.4 : 1));
+  }
+  ctx.restore();
+}
+
+function b3Bamboo(ctx, t, cam) {
+  var count = 16;
+
+  for (var i = 0; i < count; i++) {
+    var bx = -80 + b3Rand(i, 21) * (B3_W + 160);
+    var baseY = B3_H * 0.92 + b3Rand(i, 22) * B3_H * 0.08;
+    var depth = 0.55 + b3Rand(i, 23) * 0.45;
+    var h = B3_H * (0.38 + b3Rand(i, 24) * 0.30) * depth;
+    var w = (7 + b3Rand(i, 25) * 8) * depth;
+    var segs = 7 + Math.floor(b3Rand(i, 26) * 4);
+    var sway = Math.sin(t * (0.9 + depth * 0.5) + i * 0.7) * 0.035 * (0.6 + depth);
+    var alpha = 0.18 + depth * 0.22;
+    var factor = 0.30 + depth * 0.12;
+
+    ctx.save();
+    ctx.translate(bx + cam.x * factor, baseY + cam.y * factor);
+    ctx.rotate(sway);
+
+    var segLen = h / segs;
+    for (var s = 0; s < segs; s++) {
+      var y0 = -s * segLen;
+      var y1 = y0 - segLen;
+      ctx.strokeStyle = b3Ink(145, alpha);
+      ctx.lineWidth = Math.max(1.4, w * (1 - s / (segs + 2)));
+      ctx.beginPath();
+      ctx.moveTo(0, y0);
+      ctx.lineTo(0, y1);
+      ctx.stroke();
+
+      ctx.strokeStyle = b3Ink(165, alpha * 0.8);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(-w * 0.55, y1);
+      ctx.lineTo(w * 0.55, y1);
+      ctx.stroke();
+    }
+
+    for (var k = 0; k < 5; k++) {
+      var ly = -h * (0.58 + k * 0.085);
+      var len = (70 + b3Rand(i * 9 + k, 27) * 90) * depth;
+      for (var side = -1; side <= 1; side += 2) {
+        ctx.strokeStyle = b3Ink(150, 0.12 + depth * 0.18);
+        ctx.lineWidth = Math.max(1.2, 2.4 * depth);
+        ctx.beginPath();
+        ctx.moveTo(0, ly);
+        ctx.quadraticCurveTo(side * len * 0.5, ly - len * 0.12, side * len, ly - len * 0.34);
+        ctx.stroke();
+      }
+    }
+
+    ctx.restore();
+  }
+}
+
+function b3Reeds(ctx, t, cam) {
+  for (var i = 0; i < 22; i++) {
+    var x = b3Rand(i, 31) * B3_W;
+    var base = B3_H * (0.88 + b3Rand(i, 32) * 0.10);
+    var len = 90 + b3Rand(i, 33) * 170;
+    var sway = Math.sin(t * 1.6 + i * 0.9) * 0.09;
+    ctx.save();
+    ctx.translate(x + cam.x * 0.62, base + cam.y * 0.62);
+    ctx.rotate(sway);
+    ctx.strokeStyle = b3Ink(135, 0.16 + b3Rand(i, 34) * 0.14);
+    ctx.lineWidth = 2 + b3Rand(i, 35) * 2;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.quadraticCurveTo(8, -len * 0.5, 18, -len);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function b3Water(ctx, t, cam) {
+  ctx.save();
+  ctx.translate(cam.x * 0.70, cam.y * 0.75);
+
+  var top = B3_H * 0.60;
+  for (var i = 0; i < 16; i++) {
+    var y = top + b3Rand(i, 41) * B3_H * 0.34;
+    var x = b3Rand(i, 42) * B3_W;
+    var len = 60 + b3Rand(i, 43) * 260;
+    var a = 0.10 + b3Rand(i, 44) * 0.16;
+    ctx.strokeStyle = b3Ink(130, a);
+    ctx.lineWidth = 1.5 + b3Rand(i, 45) * 2.5;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.quadraticCurveTo(x + len * 0.5, y - 6, x + len, y);
+    ctx.stroke();
+  }
+
+  for (var r = 0; r < 14; r++) {
+    var rx = b3Rand(r, 51) * B3_W;
+    var ry = top + 40 + b3Rand(r, 52) * B3_H * 0.30;
+    var phase = (t * 0.32 + b3Rand(r, 53)) % 1;
+    var rad = 14 + phase * 95;
+    ctx.strokeStyle = b3Ink(150, (1 - phase) * 0.28);
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    ctx.ellipse(rx, ry, rad, rad * 0.22, 0, 0, B3_TAU);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+function b3Rain(ctx, t, cam) {
+  var span = B3_H + 300;
+  ctx.save();
+  ctx.translate(cam.x * 0.55, cam.y * 0.55);
+  ctx.lineCap = 'round';
+
+  for (var i = 0; i < 120; i++) {
+    var bx = b3Rand(i, 61) * (B3_W + 120) - 60;
+    var by = b3Rand(i, 62) * span;
+    var speed = 380 + b3Rand(i, 63) * 420;
+    var y = ((by + t * speed) % span) - 150;
+    var x = bx + Math.sin(t * 0.8 + i) * 8;
+    var len = 16 + b3Rand(i, 64) * 22;
+    var alpha = 0.10 + b3Rand(i, 65) * 0.16;
+    ctx.strokeStyle = b3Ink(120, alpha);
+    ctx.lineWidth = 1 + b3Rand(i, 66) * 1.4;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x - len * 0.30, y + len);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+function b3Lantern(ctx, t, cam) {
+  var lx = B3_W * 0.52 + cam.x * 0.92;
+  var ly = B3_H * 0.33 + cam.y * 0.92;
+  var flick = 0.82 + 0.12 * Math.sin(t * 8.7) + 0.06 * Math.sin(t * 21.3 + 1.1);
+  var R = 230 * (0.92 + flick * 0.12);
+
+  ctx.save();
+  var glow = ctx.createRadialGradient(lx, ly, 6, lx, ly, R);
+  glow.addColorStop(0, b3Red(235, 0.34 * flick));
+  glow.addColorStop(0.18, b3Red(220, 0.18 * flick));
+  glow.addColorStop(0.55, b3Red(190, 0.06 * flick));
+  glow.addColorStop(1, b3Red(160, 0));
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(lx, ly, R, 0, B3_TAU);
+  ctx.fill();
+
+  ctx.fillStyle = b3Red(240, 0.78 * flick);
+  ctx.beginPath();
+  ctx.ellipse(lx, ly, 18, 26, 0, 0, B3_TAU);
+  ctx.fill();
+
+  ctx.strokeStyle = b3Red(250, 0.55 * flick);
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(lx, ly - 26);
+  ctx.lineTo(lx, ly - 44);
+  ctx.stroke();
+
+  ctx.strokeStyle = b3Red(210, 0.30 * flick);
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(lx, ly, 34, 0, B3_TAU);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* Public entry point. Back-to-front draw order. */
+function drawWorldLayers(ctx, t, cameraOffset, variant) {
+  if (!ctx) return;
+
+  var time = Number(t) || 0;
+  var cam = b3Cam(cameraOffset);
+  var mode = (typeof variant === 'number') ? variant : (time >= 35 ? 1 : 0);
+
+  ctx.save();
+  b3Sun(ctx, time, cam);
+  b3Mountains(ctx, time, cam);
+  b3Mist(ctx, time, cam, false);
+  b3Bamboo(ctx, time, cam);
+  b3Reeds(ctx, time, cam);
+  b3Water(ctx, time, cam);
+  b3Mist(ctx, time, cam, true);
+  b3Rain(ctx, time, cam);
+  if (mode === 1 && time >= 34) b3Lantern(ctx, time, cam);
+  ctx.restore();
+}
+</script>
+<script>
+// ========== B4 Captions (inline) ==========
+/* b4-captions.js - Ink Wash Cinematic - visual captions only
+ *
+ * Interface (PARTS_API.md):
+ *   initCaptions(container) -> HTMLElement[]   creates caption divs
+ *   updateCaptions(t)                          fades by timeline (0..60)
+ *
+ * container: element or element id. Deterministic. No timers.
+ * Visual text only. No sound code.
+ */
+
+var B4_CAPTIONS = [
+  {
+    start: 0.8,
+    end: 10.2,
+    text: 'Stoicism is not the absence of feeling. It is the strength to keep walking when the path disappears, when the ridge falls away and the mist closes around you.'
+  },
+  {
+    start: 10.8,
+    end: 20.2,
+    text: 'Discipline is the quiet voice that says, one more step. It does not shout. It simply returns your attention to the ground beneath your feet, again and again.'
+  },
+  {
+    start: 20.8,
+    end: 29.8,
+    text: 'Recovery is the pause that learns, the breath that resets. It is the wind that ripples the bamboo without breaking it, the water that wears the stone without rage.'
+  },
+  {
+    start: 30.4,
+    end: 40.8,
+    text: 'A crossing demands wet feet. A mountain demands empty hands. Let the stream carry what it will; the far bank is unchanged by what you hold.'
+  },
+  {
+    start: 41.4,
+    end: 51.2,
+    text: 'The cave is not retreat. It is the space between thought and action, where the breath becomes lantern, the ink becomes light, the silence becomes teacher.'
+  },
+  {
+    start: 52.0,
+    end: 58.6,
+    text: 'In stillness, the world redraws itself. The faintest glow burns through centuries of midnight.'
+  },
+  {
+    start: 59.0,
+    end: 60.0,
+    text: 'Master the silence, and you master the world.'
+  }
+];
+
+function initCaptions(container) {
+  var host = (typeof container === 'string')
+    ? document.getElementById(container)
+    : container;
+  if (!host) return [];
+  host.className = host.className ? host.className + ' ink-captions' : 'ink-captions';
+  var nodes = [];
+  for (var i = 0; i < B4_CAPTIONS.length; i++) {
+    var cap = document.createElement('div');
+    cap.className = 'ink-caption' + (i === 6 ? ' ink-caption-final' : '');
+    cap.textContent = B4_CAPTIONS[i].text;
+    cap.setAttribute('data-index', i);
+    cap.style.opacity = '0';
+    cap.style.visibility = 'hidden';
+    cap.style.transform = 'translateY(14px)';
+    host.appendChild(cap);
+    nodes.push(cap);
+  }
+  return nodes;
+}
+
+function updateCaptions(t) {
+  for (var i = 0; i < B4_CAPTIONS.length; i++) {
+    var cap = B4_CAPTIONS[i];
+    var el = document.querySelector('[data-index="' + i + '"]');
+    if (!el) continue;
+    var fade = 0;
+    if (t >= cap.start && t <= cap.end) {
+      var dt = (t - cap.start) / (cap.end - cap.start);
+      fade = dt < 0.15 ? dt / 0.15 : (dt > 0.85 ? (1 - dt) / 0.15 : 1);
+    } else if (t > cap.end) {
+      var overshoot = Math.min(1, (t - cap.end) / 2);
+      fade = 1 - overshoot;
+    }
+    el.style.opacity = fade.toFixed(3);
+    el.style.visibility = fade > 0.001 ? 'visible' : 'hidden';
+    el.style.transform = 'translateY(' + (14 * (1 - fade)).toFixed(1) + 'px)';
+  }
+}
+</script>
+<script>
+// ========== B5 Timeline (inline) ==========
+// B5 Master timeline - Ink Wash Cinematic (enhanced)
+// Global function: timeline(t) -> { cameraOffset, transition, monkPose, monkX, captionIndex, cameraZoom, cameraTilt }
+// Deterministic for t in [0, 60]. No external dependencies. No audio.
+
+function _b5clamp(v, lo, hi) {
+  if (!isFinite(v)) v = 0;
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function _b5smoothstep(a, b, x) {
+  const t = _b5clamp((x - a) / (b - a), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+function _b5lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// Keyframes: t, cameraX (px), cameraY (px), zoom (scale), tilt (deg-ish).
+const B5_KEYS = [
+  { t: 0,  x: -160, y: -20, zoom: 1.00, tilt: -6 },
+  { t: 10, x: -90,  y:  22, zoom: 1.02, tilt:  6 },
+  { t: 25, x:  60,  y: -12, zoom: 1.04, tilt: -3 },
+  { t: 35, x: -110, y:  72, zoom: 1.05, tilt: 12 },
+  { t: 45, x: 130,  y: -52, zoom: 1.09, tilt: -9 },
+  { t: 55, x: 170,  y: -28, zoom: 1.17, tilt: -3 },
+  { t: 60, x: 150,  y: -16, zoom: 1.19, tilt: -2 }
+];
+
+function _b5keyAt(t) {
+  if (t <= B5_KEYS[0].t) {
+    const k = B5_KEYS[0];
+    return { x: k.x, y: k.y, zoom: k.zoom, tilt: k.tilt };
+  }
+  if (t >= B5_KEYS[B5_KEYS.length - 1].t) {
+    const k = B5_KEYS[B5_KEYS.length - 1];
+    return { x: k.x, y: k.y, zoom: k.zoom, tilt: k.tilt };
+  }
+  for (let i = 0; i < B5_KEYS.length - 1; i++) {
+    const a = B5_KEYS[i];
+    const b = B5_KEYS[i + 1];
+    if (t >= a.t && t <= b.t) {
+      const p = (t - a.t) / (b.t - a.t);
+      const sp = p * p * (3 - 2 * p);
+      return {
+        x: _b5lerp(a.x, b.x, sp),
+        y: _b5lerp(a.y, b.y, sp),
+        zoom: _b5lerp(a.zoom, b.zoom, sp),
+        tilt: _b5lerp(a.tilt, b.tilt, sp)
+      };
+    }
+  }
+  const k = B5_KEYS[B5_KEYS.length - 1];
+  return { x: k.x, y: k.y, zoom: k.zoom, tilt: k.tilt };
+}
+
+function _b5captionIndex(t) {
+  const caps = [
+    { start: 0.8, end: 10.2 },
+    { start: 10.8, end: 20.2 },
+    { start: 20.8, end: 29.8 },
+    { start: 30.4, end: 40.8 },
+    { start: 41.4, end: 51.2 },
+    { start: 52.0, end: 58.6 },
+    { start: 59.0, end: 60.0 }
+  ];
+  for (let i = 0; i < caps.length; i++) {
+    if (t >= caps[i].start && t <= caps[i].end) return i;
+  }
+  return Math.min(Math.floor(t / 10), caps.length - 1);
+}
+
+function _b5windSway(t) {
+  return Math.sin(t * 0.9) * 2.5 + Math.sin(t * 2.1) * 1.2;
+}
+
+function _b5waterRipple(t) {
+  return Math.sin(t * 1.6) * 1.8 + Math.sin(t * 3.2 + 0.7) * 0.8;
+}
+
+function timeline(t) {
+  const T = _b5clamp(typeof t === 'number' ? t : Number(t) || 0, 0, 60);
+  const cam = _b5keyAt(T);
+
+  // wind sway and water ripple only affect vertical offset slightly
+  const wind = _b5windSway(T);
+  const ripple = (T >= 25 && T <= 35) ? _b5waterRipple(T) : 0;
+
+  // pose logic
+  let monkPose = 'walk';
+  if (T >= 45) monkPose = 'sit';
+  else if (T >= 42 && T < 45) monkPose = 'rise';
+  else if (T >= 55) monkPose = 'bowHead';
+  else if (T >= 60) monkPose = 'bowHead';
+  else if (T >= 35 && T < 45) monkPose = 'idle';
+  else if (T >= 60) monkPose = 'bowHead';
+
+  // monk horizontal position (eased across the journey)
+  const monkX = (() => {
+    if (T < 25) return _b5lerp(300, 700, _b5smoothstep(0, 25, T));
+    if (T < 35) return _b5lerp(700, 600, _b5smoothstep(25, 35, T));
+    if (T < 45) return _b5lerp(600, 550, _b5smoothstep(35, 45, T));
+    if (T < 55) return _b5lerp(550, 520, _b5smoothstep(45, 55, T));
+    return 520;
+  })();
+
+  const inkBloom = (T >= 35) ? _b5smoothstep(35, 42, T) : 0;
+
+  return {
+    cameraOffset: {
+      x: cam.x,
+      y: cam.y + wind * 0.4 + ripple * 0.3
+    },
+    transition: inkBloom,
+    monkPose: monkPose,
+    monkX: monkX,
+    captionIndex: _b5captionIndex(T),
+    cameraZoom: cam.zoom,
+    cameraTilt: cam.tilt
+  };
+}
+</script>
+
+<script>
+// ========== MAIN INTEGRATION ==========
+(function() {
+  "use strict";
+
+  const W = 1080, H = 1920;
+  let playing = false;
+  let startTime = 0;
+  let pauseTime = 0;
+  let lastT = 0;
+  let requestId = null;
+  let shader, masks, ctxA, ctxB;
+
+  const glCanvas = document.getElementById('gl');
+  const status = document.getElementById('status');
+  const timeDisplay = document.getElementById('time');
+  const playBtn = document.getElementById('play');
+  const pauseBtn = document.getElementById('pause');
+  const replayBtn = document.getElementById('replay');
+
+  // URL parameter ?t= for scrubbing.
+  const urlParams = new URLSearchParams(window.location.search);
+  const urlT = parseFloat(urlParams.get('t'));
+  const initialT = isNaN(urlT) ? 0 : Math.max(0, Math.min(60, urlT));
+
+  // Initialize parts.
+  function init() {
+    status.textContent = 'initializing shader…';
+    shader = initShader();
+    if (!shader.gl) {
+      status.textContent = 'webgl2 fallback – drawing only';
+      return;
+    }
+
+    masks = createMaskCanvases();
+    ctxA = masks.ctxA;
+    ctxB = masks.ctxB;
+
+    initCaptions('captionHost');
+    status.textContent = 'ready – click Play';
+
+    // If ?t= provided, jump to that moment.
+    if (initialT > 0) {
+      pauseTime = initialT;
+      drawFrame(initialT);
+      updateDisplay(initialT);
+      status.textContent = 'paused at t = ' + initialT.toFixed(1);
+    }
+  }
+
+  // Draw masks for variant 0 (A) and variant 1 (B).
+  function drawMasks(t) {
+    const state = timeline(t);
+    const cam = state.cameraOffset;
+
+    // Mask A (first moment, no red accent).
+    ctxA.clearRect(0, 0, W, H);
+    drawWorldLayers(ctxA, t, cam, 0);
+    drawMonk(ctxA, state.monkX, H * 0.86, t, state.monkPose);
+
+    // Mask B (second moment, red lantern appears after cave).
+    ctxB.clearRect(0, 0, W, H);
+    drawWorldLayers(ctxB, t, cam, 1);
+    drawMonk(ctxB, state.monkX, H * 0.86, t, state.monkPose);
+  }
+
+  // Render one frame at time t.
+  function drawFrame(t) {
+    if (!shader.gl) return; // fallback canvas already shown.
+    const state = timeline(t);
+    drawMasks(t);
+    renderFrame(t, state.cameraOffset, state.transition);
+    updateCaptions(t);
+    timeDisplay.textContent = 't = ' + t.toFixed(2);
+    lastT = t;
+  }
+
+  // Animation loop.
+  function frame() {
+    if (!playing) return;
+    const now = performance.now() / 1000;
+    const elapsed = now - startTime;
+    const t = pauseTime + elapsed;
+    if (t >= 60) {
+      playing = false;
+      playBtn.disabled = false;
+      pauseBtn.disabled = true;
+      drawFrame(60);
+      status.textContent = 'finished – click Replay';
+      return;
+    }
+    drawFrame(t);
+    requestId = requestAnimationFrame(frame);
+  }
+
+  // Update status display.
+  function updateDisplay(t) {
+    const prog = (t / 60 * 100).toFixed(1);
+    status.textContent = playing ? 'playing (' + prog + '%)' : 'paused at t = ' + t.toFixed(1);
+  }
+
+  // Controls.
+  playBtn.onclick = function() {
+    if (!playing) {
+      if (lastT >= 60) replayBtn.onclick(); // restart if finished.
+      playing = true;
+      startTime = performance.now() / 1000 - pauseTime;
+      playBtn.disabled = true;
+      pauseBtn.disabled = false;
+      updateDisplay(pauseTime);
+      requestId = requestAnimationFrame(frame);
+    }
+  };
+
+  pauseBtn.onclick = function() {
+    if (playing) {
+      playing = false;
+      const now = performance.now() / 1000;
+      pauseTime += (now - startTime);
+      playBtn.disabled = false;
+      pauseBtn.disabled = true;
+      updateDisplay(pauseTime);
+      if (requestId) cancelAnimationFrame(requestId);
+    }
+  };
+
+  replayBtn.onclick = function() {
+    playing = false;
+    if (requestId) cancelAnimationFrame(requestId);
+    pauseTime = 0;
+    startTime = performance.now() / 1000;
+    playBtn.disabled = false;
+    pauseBtn.disabled = true;
+    drawFrame(0);
+    updateDisplay(0);
+    status.textContent = 'ready – click Play';
+  };
+
+  // Expose timeline for debugging.
+  window.timeline = timeline;
+
+  // Start.
+  window.addEventListener('load', init);
+})();
+</script>
+</body>
+</html>
